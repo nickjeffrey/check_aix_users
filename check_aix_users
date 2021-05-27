@@ -1,0 +1,500 @@
+#!/usr/bin/perl -w
+   
+
+
+   
+# CHANGE LOG
+# ----------
+#  2010/02/14	Nick Jeffrey	Script created
+#  2010/03/16	Nick Jeffrey	Bug fixes in regex
+#  2010/03/17	Nick Jeffrey	Add check for minimum password length
+#  2010/03/17	Nick Jeffrey	Add check for maximum password age
+#  2010/03/17	Nick Jeffrey	Add check for # of login retries before account lockout
+#  2010/03/17	Nick Jeffrey	Add alert for accounts that are currently locked out
+#  2011/08/23	Nick Jeffrey	Add check to confirm root can login at local serial console (login=true)
+#  2011/08/23	Nick Jeffrey	Skip padmin user 
+#  2011/08/23	Nick Jeffrey	Allow rlogin=true for root user if PowerHA (aka HACMP) is installed.  Required for clustering.
+#  2011/08/23	Nick Jeffrey	Do not allow padmin userid to get locked out
+#  2011/08/23	Nick Jeffrey	Code refactoring to do a single "lsuser ALL" instead of individual lsuser commands for each username. Speeds up script considerably.
+#  2015/02/02	Nick Jeffrey	Skip etladmin user - request from mborhot
+#  2017/01/06	Nick Jeffrey	Change lslpp command in check_root_user subroutine to look for cluster.es.server.rte fileset instead of rsct.basic.hacmp
+#  2017/08/15	Nick Jeffrey	Tweak regex in get_user_account_details subroutine to allow underscores and dashes in usernames
+#  2020/03/04	Nick Jeffrey	Change $maxage_thresh from 13 weeks to 9 weeks to reflect NAL policy change for maximum password age
+#  2020/03/04	Nick Jeffrey	Add cloudscape to list of service accounts whose passwords do not need to expire
+   
+   
+   
+#
+# Nagios plugin for checking:
+#     - locked out user accounts on AIX
+#     - root user should not be able to login via telnet/ftp/ssh
+#     - accounts meet minimum length requirements
+#     - accounts meet maximum age requirements
+#     - accounts will be locked out after reasonable number of bad passwords
+#     - see if any account are currently locked out
+
+
+
+ 
+# NOTES
+# -----
+#  This script should return one (and only one) line of ouput.  Multiple
+#  lines of output are silently ignored by nagios.
+# 
+#  The line of output will become the body of the alert message sent by nagios
+#
+#  
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
+#  methods available in nagios.  
+#
+#  If you hare using the check_by_ssh method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#      define service {
+#              use                             generic-8x5-service
+#              hostgroup_name                  all_aix
+#              service_description             AIX users
+#              check_command                   check_by_ssh!/usr/local/nagios/libexec/check_aix_users
+#              }
+#
+#
+#  Alternatively, if you are using the NRPE method, you should have a section similar to the following in 
+#  the services.cfg file:
+#      define service{
+#               use                             generic-8x5-service
+#               hostgroup_name                  all_aix
+#               service_description             AIX users 
+#               check_command                   check_nrpe!check_aix_users -t 30
+#               normal_check_interval           240     ; only check every 4 hours
+#               notification_options            c,r     ; Send notifications about critical and recovery events
+#               }
+#  If you are using the NRPE method, you will also need a command definition similar to the following on each monitored host
+#  in the /usr/local/nagios/nrpe/nrpe.cfg file:
+#      command[check_aix_users]=/usr/local/nagios/libexec/check_aix_users
+#
+#
+#
+#  This script executes as the nagios user, but there are a few steps that need to be executed with root privileges.
+#  We handle this by using sudo to execute certain commands, so you will need to ensure that sudo is installed, and 
+#  entries similar to the following exist in the /etc/sudoers file:
+#      User_Alias      NAGIOS_USER = nagios
+#      Cmnd_Alias      LSUSER = /usr/sbin/lsuser
+#      NAGIOS_USER ALL = (root) NOPASSWD: LSUSER
+#
+#
+#
+#
+#
+# TROUBLESHOOTING
+# ---------------
+#   If you have trouble with this nagios check, here are a few hints.
+#     1) Be sure have you sudo installed and configured.  This is the number one source of issues.
+#     2) If you get the following error, it means the /etc/sudoers file is missing a required entry.
+#             Remote command execution failed: Password:
+#     3) Be sure to run this script while logged in as the nagios user (not as root).
+#
+#
+#
+# HINTS
+# -----
+#
+# If you are running this script in a low-security environment that does not care about 
+# things like maximum password age, you may be tempted to just not use this script at all.
+# Don't do that, as you will miss out on things like sanity checks for the root account.
+# Instead, just comment out the check_minlen, check_maxage subroutines at the very end of this script.
+   
+   
+   
+use strict;							#enforce good coding practices   
+  
+
+# declare variables
+my ($lsuser,$lslpp,$sudo,$sudoers,$key,@lockedout,%users,$username,$sshd_config);
+my ($verbose,$attribute,$maxage_thresh,@maxage,$minlen_thresh,@minlen);
+my ($loginretries_thresh,@loginretries,$powerha);
+my ($OK,$WARN,$CRITICAL,$UNKNOWN,$CHECK_NAME);
+$lsuser              = "/usr/sbin/lsuser";			#location of binary
+$lslpp               = "/usr/bin/lslpp";			#location of binary
+$loginretries_thresh = 3;					#threshold for failed login attempts
+$sudo                = "/usr/bin/sudo";				#location of binary
+$sudoers             = "/etc/sudoers";				#location of sudo config file
+$sshd_config         = "/etc/ssh/sshd_config";			#location of sshd config file
+$minlen_thresh       = 7;					#minimum characters in password
+$maxage_thresh       = 9;					#maximum age of password (in weeks)
+$verbose             = "no";					#for debugging
+$powerha             = "";					#initialize variable
+$CHECK_NAME          = "AIX users";      			#name of nagios check
+#
+# Nagios return codes
+#
+$OK=            0;                              		#this script returns a value to nagios for processing
+$WARN=          1;                         		     	#this script returns a value to nagios for processing
+$CRITICAL=      2;                              		#this script returns a value to nagios for processing
+$UNKNOWN=       3;                              		#this script returns a value to nagios for processing
+
+
+
+
+
+sub sanity_checks {
+   #
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm required files exist
+   #
+   if ( ! -e "$lsuser" ) {                                     #confirm file exists
+      print "ERROR: could not find $lsuser \n";
+      exit;							#exit script
+   }
+   if ( ! -x "$lsuser" ) {                                      #confirm file is executable
+      print "ERROR: $lsuser is not executable \n";
+      exit;							#exit script
+   }
+   #
+   if ( ! -e "$lslpp" ) {                                     	#confirm file exists
+      print "ERROR: could not find $lslpp \n";
+      exit;							#exit script
+   }
+   if ( ! -x "$lslpp" ) {                                       #confirm file is executable
+      print "ERROR: $lslpp is not executable \n";
+      exit;							#exit script
+   }
+   #
+   if ( ! -e "$sudo" ) { 					#confirm file exists
+      print "ERROR: could not find $sudo \n";
+      exit;							#exit script
+   }
+   if ( ! -x "$sudo" ) {            				#confirm file is executable
+      print "ERROR: $sudo is not executable \n";
+      exit;							#exit script
+   }
+   #
+   if ( ! -e "$sudoers" ) { 					#confirm file exists
+      print "ERROR: could not find $sudoers \n";
+      exit;							#exit script
+   }
+}								#end of subroutine
+
+
+
+
+sub get_user_account_details {
+   # 
+   # build a hash that contains all of the user accounts
+   #
+   print "running get_list_of_users subroutine \n" if ($verbose eq "yes");
+   #
+   open (IN,"$sudo $lsuser -a id login rlogin expires loginretries account_locked time_last_login unsuccessful_login_count minlen maxage ALL |");
+   while (<IN>) {
+      #
+      # figure out the username 
+      undef $username if $username;				#ensure we do not use the same username twice
+      $username              = $1 if (/(^[a-zA-Z0-9_\-]+) /);
+      print "Found username $username \n" if ($verbose eq "yes");
+      #
+      next if ( $username eq "bin"        );			#skip accounts built into the operating system
+      next if ( $username eq "adm"        );			#skip accounts built into the operating system
+      next if ( $username eq "daemon"     );			#skip accounts built into the operating system
+      next if ( $username eq "guest"      );			#skip accounts built into the operating system
+      next if ( $username eq "lpd"        );			#skip accounts built into the operating system
+      next if ( $username eq "nobody"     );			#skip accounts built into the operating system
+      next if ( $username eq "sys"        );			#skip accounts built into the operating system
+      next if ( $username eq "uucp"       );			#skip accounts built into the operating system
+      next if ( $username eq "esaadmin"   );			#skip accounts built into the operating system
+      next if ( $username eq "invscout"   );			#skip accounts built into the operating system
+      next if ( $username eq "ipsec"      );			#skip accounts built into the operating system
+      next if ( $username eq "lp"         );			#skip accounts built into the operating system
+      next if ( $username eq "nuucp"      );			#skip accounts built into the operating system
+      next if ( $username eq "snapp"      );			#skip accounts built into the operating system
+      next if ( $username eq "nagios"     );			#skip account  used for cacti monitoring
+      next if ( $username eq "cacti"      );			#skip account  used for cacti monitoring
+      next if ( $username eq "brocade"    );			#skip account  used for backing up brocade configs
+      next if ( $username eq "hmc"        );			#skip account  used for backing up HMC configs
+      next if ( $username eq "macropa"    );			#skip account  used by qbyte
+      next if ( $username eq "qbyte"      );			#skip account  used by qbyte
+      next if ( $username eq "etladmin"   );			#skip account  used by informatica
+      next if ( $username eq "cloudscape" );			#skip account  used by CloudScape service discovery via SSH
+      #
+      # put username and uid into hash
+      next unless $username;					#skip any lines without a username
+      $users{$username}{username}                 = $username;
+      $users{$username}{id}                       = $1 if (/ id=([0-9]+)/);
+      $users{$username}{login}                    = $1 if (/ login=([a-z]+)/); 	#look for a space before login to avoid matching on rlogin		
+      $users{$username}{rlogin}                   = $1 if (/rlogin=([a-z]+)/); 
+      $users{$username}{expires}                  = $1 if (/expires=([0-9]+)/); 
+      $users{$username}{loginretries}             = $1 if (/loginretries=([0-9]+)/); 
+      $users{$username}{account_locked}           = $1 if (/account_locked=([a-z]+)/); 
+      $users{$username}{minlen}                   = $1 if (/minlen=([0-9]+)/); 
+      $users{$username}{maxage}                   = $1 if (/maxage=([0-9]+)/); 
+      $users{$username}{time_last_login}          = 0;	#will be null if never logged in - initialize to zero to avoid undef errors
+      $users{$username}{time_last_login}          = $1 if (/time_last_login=([0-9]+)/); 
+      $users{$username}{unsuccessful_login_count} = 0;	#will be null if never logged in - initialize to zero to avoid undef errors
+      $users{$username}{unsuccessful_login_count} = $1 if (/unsuccessful_login_count=([0-9]+)/); 
+      print "$username id=$users{$username}{id} login=$users{$username}{login} rlogin=$users{$username}{rlogin} expires=$users{$username}{expires} loginretries=$users{$username}{loginretries} account_locked=$users{$username}{account_locked} time_last_login=$users{$username}{time_last_login} unsuccessful_login_count=$users{$username}{unsuccessful_login_count} minlen=$users{$username}{minlen} maxage=$users{$username}{maxage} \n" if ($verbose eq "yes");
+   }								#end of while loop
+   close IN;							#close filehandle
+}								#end of subroutine
+
+
+
+
+
+
+sub check_padmin_user {
+   #
+   # We have a separate subroutine for the padmin user because:
+   #     1) padmin can be locked out if someone sets loginretries=3
+   #     2) since a VIO server may only have a known padmin userid (ie the root password may not be known), we do not want the padmin user to be locked out
+   #
+   #
+   print "Running check_padmin_user subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm the padmin userid exists (it will normally only be on a VIO server)
+   #
+   foreach $key (sort keys %users) {						#loop through for each userid
+      #
+      if ( $key eq "padmin" ) {							#find the padmin user
+         print "Found padmin userid \n" if ($verbose eq "yes");
+         #
+         if ( $users{padmin}{loginretries}  ) {					#confirm hash value exists
+            if ( $users{padmin}{loginretries} != 0 ) {
+               print "$CHECK_NAME WARN - the padmin userid can be locked out after $users{padmin}{loginretries} bad password attempts.  Since this account is used to administer the VIO server, it should not get locked out.  Please ensure a strong password is set for the padmin userid, and fix up the account with: chuser loginretries=0 padmin  \n";
+               exit $WARN;
+            }									#end of if block
+         }										#end of if block
+         #
+         if ( $users{padmin}{unsuccessful_login_count}  ) {					#confirm hash value exists
+            if ( $users{padmin}{unsuccessful_login_count} > $loginretries_thresh ) {
+               print "$CHECK_NAME WARN - padmin userid has $users{padmin}{unsuccessful_login_count} bad login attempts.  Potential breakin attempt or legitimate user error.  Please investigate. When done, reset failed login count with: chsec -f /etc/security/lastlog -a unsuccessful_login_count=0 -s padmin \n";
+               exit $WARN;
+            }									#end of if block
+         }									#end of if block
+      }										#end of if block
+   }										#end of foreach loop
+}										#end of subroutine
+
+sub check_root_user {
+   #
+   # We have a separate subroutine for the root user because:
+   #     1) root cannot be locked out due to bad password attempts
+   #     2) unlike other user accounts, we do not want root to be able to login remotely via telnet/rlogin/rsh
+   #     3) unlike other user accounts, we do not want root to be able to login remotely via ssh
+   #
+   #
+   print "Running check_root_user subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm the root user is permitted to login locally at the console
+   #
+   if ( ! $users{root}{login} ) {
+      print "$CHECK_NAME WARN - the monitoring script could not determine if root user is able to login at the local console.  Error reading the output of lsuser -a login root \n";
+      exit $WARN;
+   }					#end of if block
+   if ( $users{root}{login} eq "false" ) {
+      print "$CHECK_NAME WARN - root user cannot login at the local console.  This can make your life miserable in an emergency, and is not considered a security risk, as the local console is physically secured in a locked room.  Fix up with: chuser login=true root \n";
+      exit $WARN;
+   }					#end of if block
+   #
+   # confirm the root user is not permitted to login remotely via telnet/ftp
+   # Please note that PowerHA (formerly known as HACMP) requires root to be able to login remotely from any node in the cluster.
+   # This means that if PowerHA is installed, the root user must have the rlogin=true attribute
+   #
+   open (IN,"$lslpp -l |"); 					#open filehandle using command output
+   while (<IN>) {
+      if ( /cluster.es.server.rte/) {						#look for this installed package to indicated that PowerHA is installed
+         $powerha = "installed";
+      }										#end if if block
+   }										#end of while loop
+   close IN;									#close filehandle
+   if ( ! $users{root}{rlogin} ) {
+      print "$CHECK_NAME WARN - the monitoring script could not determine if root user is able to login remotely.  Error reading the output of lsuser -a rlogin root \n";
+      exit $WARN;
+   }					#end of if block
+   if ( $powerha ne "installed" ) {
+      if ( $users{root}{rlogin} eq "true" ) {
+         print "$CHECK_NAME WARN - root user can login remotely.  This is considered a security risk.  You should force users to login with their own userid, then su or sudo to root.  Fix up with: chuser rlogin=false root \n";
+         exit $WARN;
+      }					#end of if block
+   }					#end of if block
+   #
+   # confirm the root user does not have multiple bad password attempts
+   #
+   if ( $users{root}{unsuccessful_login_count} >= $loginretries_thresh ) {
+      print "$CHECK_NAME WARN - root user has $users{root}{unsuccessful_login_count} failed logins.  Possible breakin attempt.  Please investigate.  Please note that the root user cannot be locked out due to bad password attempts.  When done, reset failed login count with: chsec -f /etc/security/lastlog -a unsuccessful_login_count=0 -s root \n";
+
+      exit $WARN;
+   }					#end of if block
+   #
+   #
+   #
+   # confirm the root user is not able to login remotely via ssh
+   #
+   if ( -e "$sshd_config" ) {		#confirm SSH config file exists (since SSH is not installed by default)
+      open (IN,"$sshd_config");
+      while (<IN>) {
+         if ( /^PermitRootLogin yes/i ){
+            print "$CHECK_NAME WARN - root user can login via SSH.  This is considered a security risk.  You should force users to login with their own userid, then su or sudo to root.  Fix up the PermitRootLogin line in /etc/ssh/sshd_config and restart the ssh daemon. \n";
+            exit $WARN;
+         }				#end of if block
+      }					#end of while loop
+   }					#end of if block
+}					#end of subroutine
+
+
+
+sub check_lockedout {
+   #
+   # this subroutine checks to see if any accounts have been locked out due to bad password attempts
+   #
+   print "Running check_lockedout subroutine \n" if ($verbose eq "yes");
+   #
+   foreach $key (sort keys %users) {
+      next if ( $key eq "root" );			#skip root user because it cannot be locked out
+      #
+      # check to see if there are any locked out users
+      #
+      if ( ! $users{$key}{unsuccessful_login_count} ) {	#bad login count not defined - user may have never logged in
+         $users{$key}{unsuccessful_login_count} = 0;	#set a sane low value to avoid undef errors
+      }							#end of if block
+      if ( $users{$key}{unsuccessful_login_count} >= $loginretries_thresh ) { 
+         push (@lockedout,$key);			#add user to list of locked out accountsbad password lengths
+      }							#end of if block
+   }							#end of foreach loop
+   #
+   # if the array of locked out users has one or more elements, send an alert
+   # HINT: $#lockedout gives the index of the last element in the array, which starts from zero 
+   #       So, if $#lockedout equals 0, it really means there is one element in the array 
+   #
+   if ( $#lockedout >= 0 ) {					#check for 2 or more account lockouts 
+      print "$CHECK_NAME WARN - @lockedout user account(s) locked out.  Potential breakin attempt or legitimate user error.  Please investigate. When done, reset failed login count with: chsec -f /etc/security/lastlog -a unsuccessful_login_count=0 -s userid \n";
+      exit $WARN;
+   }								#end of if block
+}								#end of subroutine
+
+
+
+sub check_minlen {
+   #
+   # this subroutine checks the minimum length of passwords
+   #
+   print "Running check_minlen subroutine\n" if ($verbose eq "yes");
+   #
+   foreach $key (sort keys %users) {
+      #
+      # confirm users have a sane minimum password length
+      #
+      #
+      if ( ! $users{$key}{minlen} ) {			#password length is not defined
+         $users{$key}{minlen} = 0;			#set a ridiculously low value so it will be caught in the next section
+      }							#end of if block
+      if ( $users{$key}{minlen} < $minlen_thresh ) {	#user minimum password length too short
+         push (@minlen,$key);				#add user to list of bad password lengths
+      }							#end of if block
+   }							#end of foreach loop
+   #
+   #
+   # if the array of users with too short passwords thresholds has one or more elements, send an alert
+   #
+   if ( $#minlen >= 0 ) {				#check for 2 or more accounts
+      print "$CHECK_NAME WARN - @minlen account(s) have a minimum password length that is too short.  This is a security risk.  Please fix up with: chuser minlen=$minlen_thresh userid \n";
+      exit $WARN;
+   }							#end of if block
+}							#end of subroutine
+
+
+
+sub check_maxage {
+   #
+   # this subroutine checks the maximum age of passwords (in weeks)
+   #
+   print "Running check_maxage subroutine \n" if ($verbose eq "yes");
+   #
+   foreach $key (sort keys %users) {
+      #
+      # confirm users have a sane maximum password age
+      #
+      #
+      if ( ! $users{$key}{maxage} ) {			#password max age is not defined
+         $users{$key}{maxage} = 99;			#set ridiculously high value so it will be caught in the next section
+      }							#end of if block
+      if ( $users{$key}{maxage} == 0) {			#zero is same as not defined
+         $users{$key}{maxage} = 99;			#set ridiculously high value so it will be caught in the next section
+      }							#end of if block
+      if ( $users{$key}{maxage} > $maxage_thresh ) {	#password does not expire often enough
+         push (@maxage,$key);				#add user to list of bad password lengths
+      }							#end of if block
+   }							#end of foreach loop
+   #
+   #
+   # if the array of users with passwords that do not regularly expire has one or more elements, send an alert
+   #
+   if ( $#maxage >= 0 ) {				#check for 2 or more accounts
+      print "$CHECK_NAME WARN - @maxage account(s) have a maximum password age that is too long, so the passwords are not prompted to be regularly changed.    This is a security risk.  Please fix up with: chuser maxage=$maxage_thresh userid \n";
+      exit $WARN;
+   }							#end of if block
+}							#end of subroutine
+
+
+sub check_loginretries {
+   #
+   # this subroutine checks to see if accounts are configured to lock in the event of multiple bad passwords
+   #
+   print "Running check_loginretries subroutine \n" if ($verbose eq "yes");
+   #
+   foreach $key (sort keys %users) {
+      #
+      # confirm users have a defined lockout threshold at a minimally secure level
+      #
+      #
+      if ( ! $users{$key}{loginretries} ) {	#user lockout threshold is not defined
+         $users{$key}{loginretries} = 99;	#set a ridiculously high value so it will be caught in the next section
+      }					#end of if block
+      #
+      if ( $users{$key}{loginretries} == 0 ) {#user lockout threshold is not defined
+         $users{$key}{loginretries} = 99;	#set a ridiculously high value so it will be caught in the next section
+      }					#end of if block
+      #    
+      if ( $users{$key}{loginretries} > $loginretries_thresh ) {	#user lockout threshold is too high
+         next if ( $users{$key}{username} eq "root" );			#skip for root user
+         next if ( $users{$key}{username} eq "padmin" );		#skip for padmin user on VIO servers
+         push (@loginretries,$key);		#add user to list of bad thresholds
+      }							#end of if block
+   }							#end of foreach loop
+   #
+   #
+   # if the array of users with accounts that do NOT get locked due to bad passwords has one or more elements, send an alert
+   #
+   if ( $#loginretries >= 0 ) {				#check for 2 or more accounts
+      print "$CHECK_NAME WARN - @loginretries account(s) do not get locked out after a reasonable number of bad password attempts.  This is a security risk, because it does not protect the system against brute force password attacks.  Please fix up with: chuser loginretries=$loginretries_thresh userid \n";
+      exit $WARN;
+   }							#end of if block
+}							#end of subroutine
+
+
+
+
+
+
+
+
+sub all_clear {
+   #
+   # if we get this far, it means that no problems were detected
+   #
+   print "Running all_clear subroutine \n" if ($verbose eq "yes");
+   print "$CHECK_NAME OK - all user accounts within normal parameters \n";
+   exit $OK;
+}                                                               #end of subroutine
+
+
+
+# ------------------ main body of program ---------------------
+sanity_checks;
+get_user_account_details;
+check_padmin_user;
+check_root_user;
+check_lockedout;
+check_minlen;
+check_maxage;
+check_loginretries;
+all_clear; 
+

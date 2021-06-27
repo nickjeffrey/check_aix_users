@@ -48,7 +48,7 @@ We handle this by using sudo to execute certain commands, so you will need to en
 ```
 
 
-# HINTS
+# Hints
 If you are running this script in a low-security environment that does not care about  things like maximum password age, you may be tempted to just not use this script at all.
 Don't do that, as you will miss out on things like sanity checks for the root account.
 Instead, just comment out the check_minlen, check_maxage subroutines at the very end of the script.

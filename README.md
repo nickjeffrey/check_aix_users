@@ -69,7 +69,7 @@ AIX users WARN - root user can login remotely.  This is considered a security ri
 ```
 
 ```
-AIX users WARN - janedoe,johnsmithaccount(s) have a maximum password age that is too long, so the passwords are not prompted to be regularly changed. This is a security risk.  Please fix up with: chuser maxage=## userid
+AIX users WARN - janedoe,johnsmith account(s) have a maximum password age that is too long, so the passwords are not prompted to be regularly changed. This is a security risk.  Please fix up with: chuser maxage=## userid
 ```
 
 ```

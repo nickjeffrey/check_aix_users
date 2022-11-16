@@ -53,3 +53,30 @@ If you are running this script in a low-security environment that does not care 
 Don't do that, as you will miss out on things like sanity checks for the root account.
 Instead, just comment out the check_minlen, check_maxage subroutines at the very end of the script.
 
+# Sample Output
+
+
+```
+AIX users OK - all user accounts within normal parameters
+```
+
+```
+AIX users WARN - janedoe,johnsmith user account(s) locked out.  Potential breakin attempt or legitimate user error.  Please investigate. When done, reset failed login count with: chsec -f /etc/security/lastlog -a unsuccessful_login_count=0 -s userid 
+```
+
+```
+AIX users WARN - root user can login remotely.  This is considered a security risk.  You should force users to login with their own userid, then su or sudo to root.  Fix up with: chuser rlogin=false root
+```
+
+```
+AIX users WARN - janedoe,johnsmithaccount(s) have a maximum password age that is too long, so the passwords are not prompted to be regularly changed. This is a security risk.  Please fix up with: chuser maxage=## userid
+```
+
+```
+AIX users WARN - janedoe,johnsmith account(s) do not get locked out after a reasonable number of bad password attempts.  This is a security risk, because it does not protect the system against brute force password attacks.  Please fix up with: chuser loginretries=## userid
+```
+
+```
+AIX users WARN - janedoe,johnsmith account(s) have a minimum password length that is too short.  This is a security risk.  Please fix up with: chuser minlen=## userid
+```
+
